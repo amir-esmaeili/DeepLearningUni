@@ -9,9 +9,25 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 import shutil
-import json
 import traceback
 from pathlib import Path
+
+# Set random seed for reproducibility
+tf.random.set_seed(42)
+np.random.seed(42)
+
+# Configuration parameters
+IMG_HEIGHT = 224
+IMG_WIDTH = 224
+BATCH_SIZE = 16
+EPOCHS = 2
+NUM_CLASSES = 2
+LEARNING_RATE = 1e-4
+
+# Source directories
+main_dir = '../data/Corona'  # Replace with your directory path
+covid_dir = os.path.join(main_dir, 'covid')
+normal_dir = os.path.join(main_dir, 'normal')
 
 
 # Custom F1 Score metric
@@ -34,24 +50,34 @@ class F1Score(tf.keras.metrics.Metric):
         self.precision.reset_states()
         self.recall.reset_states()
 
-# Set random seed for reproducibility
-tf.random.set_seed(42)
-np.random.seed(42)
 
-# Configuration parameters
-IMG_HEIGHT = 224
-IMG_WIDTH = 224
-BATCH_SIZE = 8  # Reduced batch size
-EPOCHS = 100
-NUM_CLASSES = 2
+# Custom Learning Rate Scheduler
+class CustomLearningRateScheduler(tf.keras.callbacks.Callback):
+    def __init__(self, patience=5, factor=0.5, min_lr=1e-7):
+        super(CustomLearningRateScheduler, self).__init__()
+        self.patience = patience
+        self.factor = factor
+        self.min_lr = min_lr
+        self.wait = 0
+        self.best_loss = float('inf')
 
-# Source directories
-main_dir = '../data/Corona'  # Replace with your directory path
-covid_dir = os.path.join(main_dir, 'covid')
-normal_dir = os.path.join(main_dir, 'normal')
+    def on_epoch_end(self, epoch, logs=None):
+        current_loss = logs.get('val_loss')
+        if current_loss < self.best_loss:
+            self.best_loss = current_loss
+            self.wait = 0
+        else:
+            self.wait += 1
+            if self.wait >= self.patience:
+                old_lr = tf.keras.backend.get_value(self.model.optimizer.lr)
+                if old_lr > self.min_lr:
+                    new_lr = old_lr * self.factor
+                    new_lr = max(new_lr, self.min_lr)
+                    tf.keras.backend.set_value(self.model.optimizer.lr, new_lr)
+                    print(f'\nEpoch {epoch}: reducing learning rate to {new_lr}')
+                    self.wait = 0
 
 
-# Calculate class weights
 def calculate_class_weights(covid_dir, normal_dir):
     n_normal = len([f for f in os.listdir(normal_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
     n_covid = len([f for f in os.listdir(covid_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
@@ -59,7 +85,7 @@ def calculate_class_weights(covid_dir, normal_dir):
 
     weights = {
         0: (total / (2 * n_normal)),  # Normal class
-        1: (total / (2 * n_covid))  # COVID class
+        1: (total / (2 * n_covid)) * 1.5  # COVID class with additional weight
     }
     return weights, n_normal, n_covid
 
@@ -91,7 +117,6 @@ def prepare_dataset():
         train_files, temp_files = train_test_split(files, test_size=0.3, random_state=42)
         val_files, test_files = train_test_split(temp_files, test_size=0.5, random_state=42)
 
-        # Copy files with augmentation for COVID class if needed
         for file, split in zip([train_files, val_files, test_files], ['train', 'validation', 'test']):
             for f in file:
                 src = os.path.join(class_dir, f)
@@ -110,209 +135,165 @@ def prepare_dataset():
     return temp_dir
 
 
-# Enhanced data augmentation
 train_datagen = ImageDataGenerator(
-    rescale=1. / 255,
-    rotation_range=30,
-    width_shift_range=0.2,
-    height_shift_range=0.2,
-    shear_range=0.2,
-    zoom_range=0.3,
+    rescale=1./255,
+    rotation_range=45,            # Increased rotation range
+    width_shift_range=0.4,        # Increased shift range
+    height_shift_range=0.4,       # Increased shift range
+    shear_range=0.4,             # Increased shear range
+    zoom_range=[0.7, 1.3],       # More aggressive zoom
     horizontal_flip=True,
     vertical_flip=True,
     fill_mode='nearest',
-    brightness_range=[0.8, 1.2]
+    brightness_range=[0.6, 1.4],  # More aggressive brightness
+    channel_shift_range=50.0,     # Added channel shift
+    preprocessing_function=None    # You can add custom preprocessing here
 )
+
+
+# Function to create additional augmented samples
+def augment_data(image_generator, source_dir, target_dir, n_samples_per_image=5):
+    """
+    Generate augmented samples for each image in the source directory
+    """
+    if not os.path.exists(target_dir):
+        os.makedirs(target_dir)
+
+    # Get list of images
+    images = [f for f in os.listdir(source_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
+    for image_file in images:
+        # Load image
+        img = tf.keras.preprocessing.image.load_img(
+            os.path.join(source_dir, image_file),
+            target_size=(IMG_HEIGHT, IMG_WIDTH)
+        )
+        x = tf.keras.preprocessing.image.img_to_array(img)
+        x = x.reshape((1,) + x.shape)
+
+        # Generate augmented images
+        i = 0
+        for batch in image_generator.flow(
+                x,
+                batch_size=1,
+                save_to_dir=target_dir,
+                save_prefix=f'aug_{os.path.splitext(image_file)[0]}',
+                save_format='jpg'
+        ):
+            i += 1
+            if i >= n_samples_per_image:
+                break
+
+
+def prepare_augmented_dataset():
+    temp_dir = 'temp_dataset'
+    augmented_dir = 'augmented_dataset'
+
+    # Create directories
+    for split in ['train', 'validation', 'test']:
+        for cls in ['covid', 'normal']:
+            os.makedirs(os.path.join(augmented_dir, split, cls), exist_ok=True)
+
+    # Prepare initial dataset
+    base_dir = prepare_dataset()
+
+    # Augment training data
+    print("Augmenting COVID training data...")
+    augment_data(
+        train_datagen,
+        os.path.join(base_dir, 'train', 'covid'),
+        os.path.join(augmented_dir, 'train', 'covid'),
+        n_samples_per_image=10  # Generate 10 augmented samples per COVID image
+    )
+
+    print("Augmenting Normal training data...")
+    augment_data(
+        train_datagen,
+        os.path.join(base_dir, 'train', 'normal'),
+        os.path.join(augmented_dir, 'train', 'normal'),
+        n_samples_per_image=5  # Generate 5 augmented samples per Normal image
+    )
+
+    # Copy validation and test data without augmentation
+    for split in ['validation', 'test']:
+        for cls in ['covid', 'normal']:
+            src_dir = os.path.join(base_dir, split, cls)
+            dst_dir = os.path.join(augmented_dir, split, cls)
+            for file in os.listdir(src_dir):
+                shutil.copy2(
+                    os.path.join(src_dir, file),
+                    os.path.join(dst_dir, file)
+                )
+
+    return augmented_dir
+
 
 # Validation and test data only get rescaled
 val_datagen = ImageDataGenerator(rescale=1. / 255)
 test_datagen = ImageDataGenerator(rescale=1. / 255)
 
-# Prepare the dataset
-dataset_dir = prepare_dataset()
-
-# Create data generators
-train_generator = train_datagen.flow_from_directory(
-    os.path.join(dataset_dir, 'train'),
-    target_size=(IMG_HEIGHT, IMG_WIDTH),
-    batch_size=BATCH_SIZE,
-    class_mode='binary',
-    shuffle=True
-)
-
-validation_generator = val_datagen.flow_from_directory(
-    os.path.join(dataset_dir, 'validation'),
-    target_size=(IMG_HEIGHT, IMG_WIDTH),
-    batch_size=BATCH_SIZE,
-    class_mode='binary'
-)
-
-test_generator = test_datagen.flow_from_directory(
-    os.path.join(dataset_dir, 'test'),
-    target_size=(IMG_HEIGHT, IMG_WIDTH),
-    batch_size=BATCH_SIZE,
-    class_mode='binary'
-)
-
 
 def build_model(input_size=(224, 224, 3)):
     """
-    Build U-Net model for binary classification
+    Build an improved CNN model for binary classification
     """
-    # Encoder
-    inputs = tf.keras.Input(input_size)
-
-    # Encoder path (contracting)
-    # Block 1
-    conv1 = layers.Conv2D(64, 3, activation='relu', padding='same')(inputs)
-    conv1 = layers.Conv2D(64, 3, activation='relu', padding='same')(conv1)
-    pool1 = layers.MaxPooling2D(pool_size=(2, 2))(conv1)
-    pool1 = layers.Dropout(0.25)(pool1)
-
-    # Block 2
-    conv2 = layers.Conv2D(128, 3, activation='relu', padding='same')(pool1)
-    conv2 = layers.Conv2D(128, 3, activation='relu', padding='same')(conv2)
-    pool2 = layers.MaxPooling2D(pool_size=(2, 2))(conv2)
-    pool2 = layers.Dropout(0.3)(pool2)
-
-    # Block 3
-    conv3 = layers.Conv2D(256, 3, activation='relu', padding='same')(pool2)
-    conv3 = layers.Conv2D(256, 3, activation='relu', padding='same')(conv3)
-    pool3 = layers.MaxPooling2D(pool_size=(2, 2))(conv3)
-    pool3 = layers.Dropout(0.35)(pool3)
-
-    # Block 4
-    conv4 = layers.Conv2D(512, 3, activation='relu', padding='same')(pool3)
-    conv4 = layers.Conv2D(512, 3, activation='relu', padding='same')(conv4)
-    pool4 = layers.MaxPooling2D(pool_size=(2, 2))(conv4)
-    pool4 = layers.Dropout(0.4)(pool4)
-
-    # Bridge
-    conv5 = layers.Conv2D(1024, 3, activation='relu', padding='same')(pool4)
-    conv5 = layers.Conv2D(1024, 3, activation='relu', padding='same')(conv5)
-    conv5 = layers.Dropout(0.5)(conv5)
-
-    # Decoder path (expanding)
-    # Block 6
-    up6 = layers.Conv2DTranspose(512, (2, 2), strides=(2, 2), padding='same')(conv5)
-    up6 = layers.concatenate([up6, conv4])
-    conv6 = layers.Conv2D(512, 3, activation='relu', padding='same')(up6)
-    conv6 = layers.Conv2D(512, 3, activation='relu', padding='same')(conv6)
-    conv6 = layers.Dropout(0.4)(conv6)
-
-    # Block 7
-    up7 = layers.Conv2DTranspose(256, (2, 2), strides=(2, 2), padding='same')(conv6)
-    up7 = layers.concatenate([up7, conv3])
-    conv7 = layers.Conv2D(256, 3, activation='relu', padding='same')(up7)
-    conv7 = layers.Conv2D(256, 3, activation='relu', padding='same')(conv7)
-    conv7 = layers.Dropout(0.35)(conv7)
-
-    # Block 8
-    up8 = layers.Conv2DTranspose(128, (2, 2), strides=(2, 2), padding='same')(conv7)
-    up8 = layers.concatenate([up8, conv2])
-    conv8 = layers.Conv2D(128, 3, activation='relu', padding='same')(up8)
-    conv8 = layers.Conv2D(128, 3, activation='relu', padding='same')(conv8)
-    conv8 = layers.Dropout(0.3)(conv8)
-
-    # Block 9
-    up9 = layers.Conv2DTranspose(64, (2, 2), strides=(2, 2), padding='same')(conv8)
-    up9 = layers.concatenate([up9, conv1])
-    conv9 = layers.Conv2D(64, 3, activation='relu', padding='same')(up9)
-    conv9 = layers.Conv2D(64, 3, activation='relu', padding='same')(conv9)
-    conv9 = layers.Dropout(0.25)(conv9)
-
-    # Classification block
-    gap = layers.GlobalAveragePooling2D()(conv9)
-    dense1 = layers.Dense(256, activation='relu')(gap)
-    dense1 = layers.Dropout(0.5)(dense1)
-    dense2 = layers.Dense(128, activation='relu')(dense1)
-    dense2 = layers.Dropout(0.3)(dense2)
-    outputs = layers.Dense(1, activation='sigmoid')(dense2)
-
-    model = tf.keras.Model(inputs=[inputs], outputs=[outputs])
-    return model
-
-
-def build_alternative_model():
-    base_model = tf.keras.applications.DenseNet121(
-        include_top=False,
-        weights='imagenet',
-        input_shape=(IMG_HEIGHT, IMG_WIDTH, 3)
-    )
-
-    base_model.trainable = False
-
     model = models.Sequential([
-        base_model,
-        layers.GlobalAveragePooling2D(),
+        # First Convolutional Block
+        layers.Conv2D(64, (3, 3), padding='same', activation='relu', input_shape=input_size),
+        layers.Conv2D(64, (3, 3), padding='same', activation='relu'),
         layers.BatchNormalization(),
+        layers.MaxPooling2D((2, 2)),
+        layers.Dropout(0.3),
+
+        # Second Convolutional Block
+        layers.Conv2D(128, (3, 3), padding='same', activation='relu'),
+        layers.Conv2D(128, (3, 3), padding='same', activation='relu'),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2, 2)),
+        layers.Dropout(0.4),
+
+        # Third Convolutional Block
+        layers.Conv2D(256, (3, 3), padding='same', activation='relu'),
+        layers.Conv2D(256, (3, 3), padding='same', activation='relu'),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2, 2)),
+        layers.Dropout(0.4),
+
+        # Dense Layers
+        layers.Flatten(),
         layers.Dense(512, activation='relu'),
         layers.BatchNormalization(),
         layers.Dropout(0.5),
         layers.Dense(256, activation='relu'),
         layers.BatchNormalization(),
-        layers.Dropout(0.3),
+        layers.Dropout(0.5),
         layers.Dense(1, activation='sigmoid')
     ])
 
     return model
 
 
-# Callbacks
-checkpoint = ModelCheckpoint(
-    filepath='best_model_weights.h5',
-    monitor='val_loss',
-    mode='min',
-    save_best_only=True,
-    save_weights_only=True,
-    verbose=1
-)
-
-# Modified callbacks for U-Net
-early_stopping = EarlyStopping(
-    monitor='val_loss',
-    patience=20,  # Increased patience
-    restore_best_weights=True,
-    verbose=1
-)
-
-reduce_lr = ReduceLROnPlateau(
-    monitor='val_loss',
-    factor=0.2,
-    patience=10,  # Increased patience
-    min_lr=1e-7,
-    verbose=1
-)
-
-
 def plot_training_history(history_dict):
-    # Get all metrics except loss and val_loss
     metrics = [key for key in history_dict.keys()
                if not key.startswith('val_') and key != 'loss']
 
-    # Remove 'lr' from metrics as it doesn't have validation data
     if 'lr' in metrics:
         metrics.remove('lr')
 
-    n_metrics = len(metrics) + 1  # +1 for loss
+    n_metrics = len(metrics) + 1
     n_cols = 2
     n_rows = (n_metrics + 1) // 2
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5 * n_rows))
-    if n_rows == 1:
-        axes = np.array([axes])  # Ensure axes is always 2D
     axes = axes.ravel()
 
     # Plot loss
     axes[0].plot(history_dict['loss'])
-    if 'val_loss' in history_dict:
-        axes[0].plot(history_dict['val_loss'])
-        axes[0].legend(['Train', 'Validation'])
-    else:
-        axes[0].legend(['Train'])
+    axes[0].plot(history_dict['val_loss'])
     axes[0].set_title('Model Loss')
     axes[0].set_xlabel('Epoch')
     axes[0].set_ylabel('Loss')
+    axes[0].legend(['Train', 'Validation'])
 
     # Plot other metrics
     for i, metric in enumerate(metrics, 1):
@@ -321,26 +302,9 @@ def plot_training_history(history_dict):
         if val_metric in history_dict:
             axes[i].plot(history_dict[val_metric])
             axes[i].legend(['Train', 'Validation'])
-        else:
-            axes[i].legend(['Train'])
         axes[i].set_title(f'Model {metric.replace("_", " ").title()}')
         axes[i].set_xlabel('Epoch')
         axes[i].set_ylabel(metric.replace('_', ' ').title())
-
-    # Plot learning rate separately if it exists
-    if 'lr' in history_dict:
-        plt.figure(figsize=(10, 4))
-        plt.plot(history_dict['lr'])
-        plt.title('Learning Rate')
-        plt.xlabel('Epoch')
-        plt.ylabel('Learning Rate')
-        plt.yscale('log')  # Use log scale for learning rate
-        plt.show()
-
-    # Remove empty subplots
-    if len(metrics) + 1 < len(axes):
-        for i in range(len(metrics) + 1, len(axes)):
-            fig.delaxes(axes[i])
 
     plt.tight_layout()
     plt.show()
@@ -369,16 +333,15 @@ def evaluate_model(model, test_generator):
     y_pred = (predictions > 0.5).astype(int)
     y_true = labels
 
-    # Evaluate model and get metrics
+    # Calculate metrics
     metrics = model.evaluate(test_generator, verbose=1)
     metrics_names = model.metrics_names
 
-    # Print all metrics
     print("\nTest Results:")
     for name, value in zip(metrics_names, metrics):
         print(f"{name}: {value:.4f}")
 
-    # Calculate additional metrics
+    # Calculate F1 score
     f1 = f1_score(y_true, y_pred)
     print(f"F1 Score: {f1:.4f}")
 
@@ -391,194 +354,136 @@ def evaluate_model(model, test_generator):
     plt.xlabel('Predicted Label')
     plt.show()
 
-    # Print classification report
     print("\nClassification Report:")
     print(classification_report(y_true, y_pred, target_names=['Normal', 'COVID']))
 
     return y_true, y_pred
 
 
-# Modified create_ensemble function
-def create_ensemble():
-    models = [
-        build_model(),  # First U-Net model
-        build_model()  # Second U-Net model with different initialization
-    ]
+def train_model_with_augmentation(n_folds=5):
+    augmented_dir = prepare_augmented_dataset()
 
-    ensemble_predictions = []
+    # Create data generators with the augmented dataset
+    train_generator = train_datagen.flow_from_directory(
+        os.path.join(augmented_dir, 'train'),
+        target_size=(IMG_HEIGHT, IMG_WIDTH),
+        batch_size=BATCH_SIZE,
+        class_mode='binary',
+        shuffle=True
+    )
 
-    for i, model in enumerate(models):
-        print(f"\nTraining model {i + 1}/{len(models)}")
-        model.compile(
-            optimizer=optimizers.Adam(learning_rate=0.0001),
-            loss='binary_crossentropy',
-            metrics=[
-                'accuracy',
-                tf.keras.metrics.AUC(name='auc'),
-                tf.keras.metrics.Precision(name='precision'),
-                tf.keras.metrics.Recall(name='recall'),
-                F1Score(name='f1_score')
-            ]
-        )
+    validation_generator = val_datagen.flow_from_directory(
+        os.path.join(augmented_dir, 'validation'),
+        target_size=(IMG_HEIGHT, IMG_WIDTH),
+        batch_size=BATCH_SIZE,
+        class_mode='binary'
+    )
 
-        # Add model summary
-        print(f"\nModel {i + 1} Summary:")
-        model.summary()
+    test_generator = test_datagen.flow_from_directory(
+        os.path.join(augmented_dir, 'test'),
+        target_size=(IMG_HEIGHT, IMG_WIDTH),
+        batch_size=BATCH_SIZE,
+        class_mode='binary'
+    )
 
-        # Create callbacks
-        model_callbacks = [
-            ModelCheckpoint(
-                filepath=f'best_model_{i + 1}_weights.h5',
-                monitor='val_loss',
-                mode='min',
-                save_best_only=True,
-                save_weights_only=True,
-                verbose=1
-            ),
-            early_stopping,
-            reduce_lr
+    # Create and train the model
+    model = build_model()
+    model.compile(
+        optimizer=optimizers.Adam(learning_rate=LEARNING_RATE),
+        loss='binary_crossentropy',
+        metrics=[
+            'accuracy',
+            tf.keras.metrics.AUC(name='auc'),
+            tf.keras.metrics.Precision(name='precision'),
+            tf.keras.metrics.Recall(name='recall'),
+            F1Score(name='f1_score')
         ]
+    )
 
-        # Train the model
-        history = model.fit(
-            train_generator,
-            epochs=EPOCHS,
-            validation_data=validation_generator,
-            class_weight=CLASS_WEIGHTS,
-            callbacks=model_callbacks,
+    # Add mixup data augmentation
+    def mixup(x, y, alpha=0.2):
+        if alpha > 0:
+            lam = np.random.beta(alpha, alpha)
+        else:
+            lam = 1
+
+        batch_size = tf.shape(x)[0]
+        index = tf.random.shuffle(tf.range(batch_size))
+
+        mixed_x = lam * x + (1 - lam) * tf.gather(x, index)
+        mixed_y = lam * y + (1 - lam) * tf.gather(y, index)
+
+        return mixed_x, mixed_y
+
+    # Custom training step with mixup
+    @tf.function
+    def train_step(x, y):
+        x, y = mixup(x, y)
+        with tf.GradientTape() as tape:
+            predictions = model(x, training=True)
+            loss = tf.keras.losses.binary_crossentropy(y, predictions)
+        gradients = tape.gradient(loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+        return loss
+
+    callbacks = [
+        ModelCheckpoint(
+            'best_model.h5',
+            monitor='val_f1_score',
+            mode='max',
+            save_best_only=True,
+            verbose=1
+        ),
+        EarlyStopping(
+            monitor='val_f1_score',
+            mode='max',
+            patience=15,
+            restore_best_weights=True,
+            verbose=1
+        ),
+        CustomLearningRateScheduler(patience=8, factor=0.6),
+        ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.2,
+            patience=5,
+            min_lr=1e-7,
             verbose=1
         )
+    ]
 
-        # Plot training history for each model
-        print(f"\nPlotting training history for Model {i + 1}")
-        plot_training_history(history.history)
+    history = model.fit(
+        train_generator,
+        epochs=EPOCHS,
+        validation_data=validation_generator,
+        class_weight=CLASS_WEIGHTS,
+        callbacks=callbacks,
+        verbose=1
+    )
 
-        # Make predictions
-        print(f"\nMaking predictions with Model {i + 1}")
-        predictions = model.predict(test_generator)
-        ensemble_predictions.append(predictions)
-
-        # Evaluate individual model
-        print(f"\nEvaluating Model {i + 1}")
-        evaluate_model(model, test_generator)
-
-    # Average predictions
-    final_predictions = np.mean(ensemble_predictions, axis=0)
-    return final_predictions
-
-class LearningRateMonitor(tf.keras.callbacks.Callback):
-    def on_epoch_end(self, epoch, logs=None):
-        if not hasattr(self.model.optimizer, 'lr'):
-            return
-        logs = logs or {}
-        lr = float(tf.keras.backend.get_value(self.model.optimizer.lr))
-        logs['lr'] = lr
-
-# Update callbacks
-early_stopping = EarlyStopping(
-    monitor='val_loss',
-    patience=20,
-    restore_best_weights=True,
-    verbose=1
-)
-
-reduce_lr = ReduceLROnPlateau(
-    monitor='val_loss',
-    factor=0.2,
-    patience=10,
-    min_lr=1e-7,
-    verbose=1
-)
-
-# Add the LearningRateMonitor to your callbacks in create_ensemble
-model_callbacks = [
-    ModelCheckpoint(...),
-    early_stopping,
-    reduce_lr,
-    LearningRateMonitor()
-]
-# # Modified evaluate_model function to include F1 score calculation
-# def evaluate_model(model, test_generator):
-#     predictions = []
-#     labels = []
-#
-#     test_generator.reset()
-#
-#     for i in range(len(test_generator)):
-#         x, y = test_generator[i]
-#         pred = model.predict(x)
-#         predictions.extend(pred)
-#         labels.extend(y)
-#
-#         if len(labels) >= len(test_generator.labels):
-#             break
-#
-#     predictions = np.array(predictions)
-#     labels = np.array(labels[:len(test_generator.labels)])
-#
-#     y_pred = (predictions > 0.5).astype(int)
-#     y_true = labels
-#
-#     # Calculate metrics
-#     test_loss, test_accuracy, test_auc, test_precision, test_recall = model.evaluate(test_generator)
-#
-#     # Calculate F1 score manually
-#     f1 = f1_score(y_true, y_pred)
-#
-#     print("\nTest Results:")
-#     print(f"Loss: {test_loss:.4f}")
-#     print(f"Accuracy: {test_accuracy:.4f}")
-#     print(f"AUC: {test_auc:.4f}")
-#     print(f"Precision: {test_precision:.4f}")
-#     print(f"Recall: {test_recall:.4f}")
-#     print(f"F1 Score: {f1:.4f}")
-#
-#     # Plot confusion matrix
-#     cm = confusion_matrix(y_true, y_pred)
-#     plt.figure(figsize=(8, 6))
-#     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-#     plt.title('Confusion Matrix')
-#     plt.ylabel('True Label')
-#     plt.xlabel('Predicted Label')
-#     plt.show()
-#
-#     # Print classification report
-#     print("\nClassification Report:")
-#     print(classification_report(y_true, y_pred, target_names=['Normal', 'COVID']))
-#
-#     return y_true, y_pred
+    return model, history, test_generator
 
 
 # Main execution
 try:
-    print("Starting ensemble training...")
-    ensemble_predictions = create_ensemble()
+    print("Starting model training with augmented data...")
+    model, history, test_generator = train_model_with_augmentation()
 
-    # Evaluate ensemble predictions
-    y_true = test_generator.classes
-    y_pred_ensemble = (ensemble_predictions > 0.5).astype(int)
+    # Plot training history
+    plot_training_history(history.history)
 
-    print("\nEnsemble Model Results:")
-    print("\nClassification Report:")
-    print(classification_report(y_true, y_pred_ensemble, target_names=['Normal', 'COVID']))
-
-    # Plot confusion matrix for ensemble
-    cm = confusion_matrix(y_true, y_pred_ensemble)
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-    plt.title('Ensemble Model Confusion Matrix')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    plt.show()
+    # Evaluate model
+    print("\nEvaluating final model:")
+    evaluate_model(model, test_generator)
 
 except Exception as e:
     print(f"An error occurred: {str(e)}")
     traceback.print_exc()
 
 finally:
-    # Clean up temporary directory
-    try:
-        shutil.rmtree(dataset_dir)
-        print("Temporary directory cleaned up successfully")
-    except:
-        print("Error while deleting temporary directory")
+    # Clean up temporary directories
+    for dir_name in ['temp_dataset', 'augmented_dataset']:
+        try:
+            shutil.rmtree(dir_name)
+            print(f"{dir_name} cleaned up successfully")
+        except:
+            print(f"Error while deleting {dir_name}")
