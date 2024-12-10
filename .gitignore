@@ -1,0 +1,11 @@
+notebooks/covid19_detection_model.h5
+notebooks/covid19_detection_model_config.json
+notebooks/covid19_detection_model_finetuned.h5
+notebooks/covid19_detection_model_finetuned_config.json
+notebooks/covid19_detection_model_finetuned_weights.h5
+notebooks/covid19_detection_model_weights.h5
+
+notebooks/best_model.h5
+notebooks/best_model_1_weights.h5
+notebooks/best_model_finetuned_weights.h5
+notebooks/best_model_weights.h5
