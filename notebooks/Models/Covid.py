@@ -25,7 +25,7 @@ NUM_CLASSES = 2
 LEARNING_RATE = 1e-4
 
 # Source directories
-main_dir = '../data/Corona'  # Replace with your directory path
+main_dir = '../../data/Corona'  # Replace with your directory path
 covid_dir = os.path.join(main_dir, 'covid')
 normal_dir = os.path.join(main_dir, 'normal')
 
